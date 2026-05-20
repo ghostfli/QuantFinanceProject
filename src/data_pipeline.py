@@ -7,6 +7,8 @@ import sqlite3
 import logging
 from pathlib import Path
 from datetime import datetime, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import yfinance as yf
 import pandas as pd
@@ -18,6 +20,9 @@ DB_PATH    = ROOT / "data" / "db" / "metadata.db"
 
 PRICES_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# ── Thread-safe database access ────────────────────────────────────────────────
+db_lock = Lock()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -52,20 +57,32 @@ def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
 
 
 def update_metadata(conn: sqlite3.Connection, ticker: str, **kwargs) -> None:
-    """Upsert a ticker's metadata record."""
-    fields = ["ticker"] + list(kwargs.keys())
-    values = [ticker] + list(kwargs.values())
-    placeholders = ", ".join(["?"] * len(values))
-    updates = ", ".join(f"{k} = excluded.{k}" for k in kwargs)
-    conn.execute(
-        f"""
-        INSERT INTO ticker_metadata ({', '.join(fields)})
-        VALUES ({placeholders})
-        ON CONFLICT(ticker) DO UPDATE SET {updates}
-        """,
-        values,
-    )
-    conn.commit()
+    """Upsert a ticker's metadata record. Thread-safe."""
+    with db_lock:
+        fields = ["ticker"] + list(kwargs.keys())
+        values = [ticker] + list(kwargs.values())
+        placeholders = ", ".join(["?"] * len(values))
+        updates = ", ".join(f"{k} = excluded.{k}" for k in kwargs)
+        conn.execute(
+            f"""
+            INSERT INTO ticker_metadata ({', '.join(fields)})
+            VALUES ({placeholders})
+            ON CONFLICT(ticker) DO UPDATE SET {updates}
+            """,
+            values,
+        )
+        conn.commit()
+
+
+def get_last_download_date(conn: sqlite3.Connection, ticker: str) -> str | None:
+    """Get the last date downloaded for a ticker. Returns None if not found."""
+    with db_lock:
+        cursor = conn.execute(
+            "SELECT end_date FROM ticker_metadata WHERE ticker = ? AND status = 'ok'",
+            (ticker,)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else None
 
 
 # ── Downloading ────────────────────────────────────────────────────────────────
@@ -193,66 +210,143 @@ def run_pipeline(
     start: str = "2014-01-01",
     end: str | None = None,
     min_rows: int = 1000,           # ~4 years of trading days
+    max_workers: int = 10,          # concurrent downloads
+    incremental: bool = True,       # only download new data
 ) -> dict[str, str]:
     """
-    Run the full Phase 1 pipeline for a list of tickers.
+    Run the full Phase 1 pipeline for a list of tickers (concurrent).
 
     Downloads, cleans, saves to Parquet, and records metadata in SQLite.
 
-    Returns a dict mapping ticker -> status ('ok' | 'failed' | 'insufficient').
+    Args:
+        tickers: List of ticker symbols to download
+        start: Start date for initial historical download (YYYY-MM-DD)
+        end: End date (default: today)
+        min_rows: Minimum rows required to mark as 'ok'
+        max_workers: Number of concurrent download threads
+        incremental: If True, only download new data since last run
+
+    Returns:
+        dict mapping ticker -> status ('ok' | 'failed' | 'insufficient')
     """
     conn = init_db()
     results = {}
 
-    for i, ticker in enumerate(tickers, 1):
-        log.info(f"[{i}/{len(tickers)}] Processing {ticker}...")
+    # Phase 1: Plan which tickers to download
+    download_plan = {}
+    for ticker in tickers:
+        if incremental:
+            last_date = get_last_download_date(conn, ticker)
+            if last_date:
+                # Download from day after last successful run
+                ticker_start = (pd.Timestamp(last_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                download_plan[ticker] = ticker_start
+            else:
+                download_plan[ticker] = start
+        else:
+            download_plan[ticker] = start
 
-        raw = download_ticker(ticker, start=start, end=end)
+    log.info(f"Processing {len(tickers)} tickers with {max_workers} workers...")
 
-        if raw is None:
-            update_metadata(conn, ticker,
-                last_downloaded=date.today().isoformat(),
-                status="failed",
-                row_count=0,
-                missing_days=0,
-            )
-            results[ticker] = "failed"
-            continue
+    # Phase 2: Concurrent downloads and processing
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                process_single_ticker,
+                ticker,
+                conn,
+                download_plan[ticker],
+                end,
+                min_rows
+            ): ticker
+            for ticker in tickers
+        }
 
-        df = clean_prices(raw, ticker)
-
-        if len(df) < min_rows:
-            log.warning(f"{ticker}: only {len(df)} rows — skipping (need {min_rows})")
-            update_metadata(conn, ticker,
-                last_downloaded=date.today().isoformat(),
-                status="insufficient",
-                row_count=len(df),
-                missing_days=0,
-            )
-            results[ticker] = "insufficient"
-            continue
-
-        save_prices(df, ticker)
-
-        # Count trading days with any NaN remaining after cleaning
-        missing_days = int(df["adj_close"].isna().sum())
-
-        update_metadata(conn, ticker,
-            last_downloaded=date.today().isoformat(),
-            start_date=df.index.min().date().isoformat(),
-            end_date=df.index.max().date().isoformat(),
-            row_count=len(df),
-            missing_days=missing_days,
-            status="ok",
-        )
-
-        results[ticker] = "ok"
-        log.info(f"{ticker}: saved {len(df)} rows ✓")
+        # Track progress
+        completed = 0
+        for future in as_completed(futures):
+            ticker = futures[future]
+            completed += 1
+            try:
+                status = future.result()
+                results[ticker] = status
+                log.info(f"[{completed}/{len(tickers)}] {ticker}: {status} ✓")
+            except Exception as e:
+                results[ticker] = "failed"
+                log.error(f"[{completed}/{len(tickers)}] {ticker}: {e}")
 
     conn.close()
 
+    # Summary
     ok    = sum(1 for v in results.values() if v == "ok")
     fails = sum(1 for v in results.values() if v != "ok")
-    log.info(f"\nPipeline complete: {ok} succeeded, {fails} failed/skipped")
+    log.info(f"\n✓ Pipeline complete: {ok} succeeded, {fails} failed/skipped")
 
     return results
+
+
+def process_single_ticker(
+    ticker: str,
+    conn: sqlite3.Connection,
+    start: str,
+    end: str | None,
+    min_rows: int,
+) -> str:
+    """
+    Download, clean, and save data for a single ticker.
+    Designed to be called concurrently by ThreadPoolExecutor.
+
+    Returns:
+        status ('ok' | 'failed' | 'insufficient')
+    """
+    # Download new data
+    raw = download_ticker(ticker, start=start, end=end)
+
+    if raw is None:
+        update_metadata(conn, ticker,
+            last_downloaded=date.today().isoformat(),
+            status="failed",
+            row_count=0,
+            missing_days=0,
+        )
+        return "failed"
+
+    # Try to load existing data (for incremental updates)
+    existing = load_prices(ticker)
+
+    # Clean the new data
+    df = clean_prices(raw, ticker)
+
+    # Merge with existing if available
+    if existing is not None:
+        # Concatenate and remove duplicates (keep existing in case of conflicts)
+        df = pd.concat([existing, df])
+        df = df[~df.index.duplicated(keep='first')].sort_index()
+
+    # Check minimum row requirement
+    if len(df) < min_rows:
+        log.warning(f"{ticker}: only {len(df)} rows — skipping (need {min_rows})")
+        update_metadata(conn, ticker,
+            last_downloaded=date.today().isoformat(),
+            status="insufficient",
+            row_count=len(df),
+            missing_days=0,
+        )
+        return "insufficient"
+
+    # Save to Parquet
+    save_prices(df, ticker)
+
+    # Count missing days and update metadata
+    missing_days = int(df["adj_close"].isna().sum())
+
+    update_metadata(conn, ticker,
+        last_downloaded=date.today().isoformat(),
+        start_date=df.index.min().date().isoformat(),
+        end_date=df.index.max().date().isoformat(),
+        row_count=len(df),
+        missing_days=missing_days,
+        status="ok",
+    )
+
+    return "ok"
